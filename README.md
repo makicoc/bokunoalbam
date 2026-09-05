@@ -17,6 +17,10 @@ Google Driveの公開フォルダから写真を取得し、VRChatが標準設�
 
 Drive内の写真を追加・削除すると約30分以内に自動反映されます。すぐ反映したい場合だけ、GitHubの **Actions** から **Run workflow** を押してください。その後、VRChat内の更新ボタンを押します。
 
+Google Driveの取得は1回30秒でタイムアウトし、最大3回まで自動再試行します。それでも一時的に取得できない場合は、公開をスキップして直前のPagesデータを維持します。
+
+`.github/workflows/keepalive.yml` が月1回活動記録を更新し、GitHub Actionsの定期実行が長期間の無活動で停止されるのを防ぎます。Actionsの書き込み権限が必要です。
+
 ## 写真の順番
 
 ファイル名順です。`001_海.jpg`、`002_空.png` のように先頭へ番号を付けると確実です。JPG・JPEG・PNG・WebPに対応します。

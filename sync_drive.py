@@ -5,6 +5,9 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -17,12 +20,52 @@ IMAGES = SITE / "images"
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; VRChatDriveAlbum/1.0)"}
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
+FETCH_ATTEMPTS = 3
+FETCH_TIMEOUT_SECONDS = 30
+RETRY_DELAYS_SECONDS = (5, 15)
+
+
+def set_action_output(name: str, value: str):
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(f"{name}={value}\n")
+
+
+class FetchError(RuntimeError):
+    """A temporary or external error while downloading Drive data."""
+
+    def __init__(self, message: str, *, transient: bool = True):
+        super().__init__(message)
+        self.transient = transient
 
 
 def fetch(url: str) -> bytes:
-    request = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(request, timeout=90) as response:
-        return response.read()
+    last_error = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            request = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {408, 425, 429} and not 500 <= exc.code <= 599:
+                raise FetchError(
+                    f"外部データの取得に失敗しました（HTTP {exc.code}）。",
+                    transient=False,
+                ) from exc
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+
+        if attempt < FETCH_ATTEMPTS:
+            delay = RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)]
+            print(f"外部データの取得に失敗しました。{delay}秒後に再試行します（{attempt}/{FETCH_ATTEMPTS}）")
+            time.sleep(delay)
+
+    raise FetchError(
+        f"外部データの取得が{FETCH_ATTEMPTS}回連続で失敗しました。"
+        f"一時的な通信エラーの可能性があります: {last_error}"
+    ) from last_error
 
 
 def list_public_folder(folder_url: str):
@@ -59,24 +102,40 @@ def convert_image(source: bytes, destination: Path):
 def main():
     owner, repo = os.environ.get("GITHUB_REPOSITORY", "YOUR_NAME/YOUR_REPO").split("/", 1)
     base_url = f"https://{owner}.github.io/{repo}"
-    files = list_public_folder(CONFIG["drive_folder_url"])
-    if IMAGES.exists():
-        shutil.rmtree(IMAGES)
-    IMAGES.mkdir(parents=True, exist_ok=True)
-    manifest = {"images": []}
-    for index, (name, file_id) in enumerate(files, start=1):
-        query = urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": "t"})
-        output_name = f"{index:04d}.jpg"
-        convert_image(fetch("https://drive.usercontent.google.com/download?" + query), IMAGES / output_name)
-        manifest["images"].append({"url": f"{base_url}/images/{output_name}", "caption": Path(name).stem})
-        print(f"同期: {name} -> {output_name}")
     SITE.mkdir(parents=True, exist_ok=True)
-    (SITE / "album.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    (SITE / ".nojekyll").write_text("", encoding="utf-8")
-    (SITE / "index.html").write_text(
-        "<!doctype html><meta charset='utf-8'><title>Drive Album</title>"
-        f"<h1>Drive Album 公開完了</h1><p>写真 {len(files)} 枚</p>"
-        f"<p>Unityへ貼るURL：<code>{base_url}</code></p>", encoding="utf-8")
+    try:
+        files = list_public_folder(CONFIG["drive_folder_url"])
+        # Build the complete next version beside the current one. If any
+        # download fails, the last successful Pages data remains untouched.
+        with tempfile.TemporaryDirectory(prefix=".album-sync-", dir=str(SITE)) as temp_dir:
+            stage = Path(temp_dir)
+            stage_images = stage / "images"
+            stage_images.mkdir(parents=True, exist_ok=True)
+            manifest = {"images": []}
+            for index, (name, file_id) in enumerate(files, start=1):
+                query = urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": "t"})
+                output_name = f"{index:04d}.jpg"
+                convert_image(fetch("https://drive.usercontent.google.com/download?" + query), stage_images / output_name)
+                manifest["images"].append({"url": f"{base_url}/images/{output_name}", "caption": Path(name).stem})
+                print(f"同期: {name} -> {output_name}")
+            (stage / "album.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (stage / ".nojekyll").write_text("", encoding="utf-8")
+            (stage / "index.html").write_text(
+                "<!doctype html><meta charset='utf-8'><title>Drive Album</title>"
+                f"<h1>Drive Album 公開完了</h1><p>写真 {len(files)} 枚</p>"
+                f"<p>Unityへ貼るURL：<code>{base_url}</code></p>", encoding="utf-8")
+            if IMAGES.exists():
+                shutil.rmtree(IMAGES)
+            shutil.move(str(stage_images), str(IMAGES))
+            for file_name in ("album.json", ".nojekyll", "index.html"):
+                os.replace(stage / file_name, SITE / file_name)
+    except FetchError as exc:
+        if exc.transient:
+            set_action_output("skipped", "true")
+            print(f"一時的にGoogle Driveを取得できないため、公開をスキップして前回のPagesデータを維持します: {exc}")
+            return
+        raise
+    set_action_output("skipped", "false")
     print(f"Unityへ貼るURL: {base_url}")
 
 
